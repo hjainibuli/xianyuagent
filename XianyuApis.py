@@ -8,26 +8,80 @@ from loguru import logger
 from utils.xianyu_utils import generate_sign
 
 
+class RiskControlError(RuntimeError):
+    """Raised when Goofish explicitly requires user validation."""
+
+    def __init__(self, ret_value):
+        self.ret_value = ret_value
+        super().__init__(str(ret_value))
+
+
+def _detect_chrome_major_version():
+    """Return the configured/installed Chrome major version when available."""
+    configured_version = os.getenv("CHROME_MAJOR_VERSION", "").strip()
+    if configured_version:
+        match = re.search(r"\d+", configured_version)
+        if match:
+            return match.group(0)
+
+    try:
+        import winreg
+
+        registry_locations = (
+            (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Google\Chrome\BLBeacon"),
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Google\Chrome\BLBeacon"),
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Google\Chrome\BLBeacon"),
+        )
+        for hive, path in registry_locations:
+            try:
+                with winreg.OpenKey(hive, path) as key:
+                    version, _ = winreg.QueryValueEx(key, "version")
+                match = re.match(r"(\d+)", str(version))
+                if match:
+                    return match.group(1)
+            except OSError:
+                continue
+    except (ImportError, OSError):
+        pass
+
+    return "150"
+
+
+def _build_browser_headers():
+    """Build one consistent, configurable browser-like request profile."""
+    chrome_major = _detect_chrome_major_version()
+    user_agent = os.getenv(
+        "BROWSER_USER_AGENT",
+        (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            f"Chrome/{chrome_major}.0.0.0 Safari/537.36"
+        ),
+    ).strip()
+    accept_language = os.getenv(
+        "BROWSER_ACCEPT_LANGUAGE",
+        "zh-CN,zh;q=0.9,en;q=0.8",
+    ).strip()
+
+    # requests does not have Chromium's TLS/client-hint implementation. Sending
+    # hard-coded sec-ch-ua/sec-fetch values makes the HTTP profile contradict
+    # itself, so keep only headers this client can represent consistently.
+    return {
+        "accept": "application/json",
+        "accept-language": accept_language,
+        "cache-control": "no-cache",
+        "origin": "https://www.goofish.com",
+        "pragma": "no-cache",
+        "referer": "https://www.goofish.com/",
+        "user-agent": user_agent,
+    }
+
+
 class XianyuApis:
     def __init__(self):
         self.url = 'https://h5api.m.goofish.com/h5/mtop.taobao.idlemessage.pc.login.token/1.0/'
         self.session = requests.Session()
-        self.session.headers.update({
-            'accept': 'application/json',
-            'accept-language': 'zh-CN,zh;q=0.9',
-            'cache-control': 'no-cache',
-            'origin': 'https://www.goofish.com',
-            'pragma': 'no-cache',
-            'priority': 'u=1, i',
-            'referer': 'https://www.goofish.com/',
-            'sec-ch-ua': '"Not(A:Brand";v="99", "Google Chrome";v="133", "Chromium";v="133"',
-            'sec-ch-ua-mobile': '?0',
-            'sec-ch-ua-platform': '"Windows"',
-            'sec-fetch-dest': 'empty',
-            'sec-fetch-mode': 'cors',
-            'sec-fetch-site': 'same-site',
-            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36',
-        })
+        self.session.headers.update(_build_browser_headers())
         
     def clear_duplicate_cookies(self):
         """清理重复的cookies"""
@@ -152,7 +206,7 @@ class XianyuApis:
         params = {
             'jsv': '2.7.2',
             'appKey': '34839810',
-            't': str(int(time.time()) * 1000),
+            't': str(int(time.time() * 1000)),
             'sign': '',
             'v': '1.0',
             'type': 'originaljson',
@@ -162,28 +216,13 @@ class XianyuApis:
             'api': 'mtop.taobao.idlemessage.pc.login.token',
             'sessionOption': 'AutoLoginOnly',
             'spm_cnt': 'a21ybx.im.0.0',
-            "spm_pre": "a21ybx.item.want.1.14ad3da6ALVq3n",
-            "log_id": "14ad3da6ALVq3n"
         }
         data_val = '{"appKey":"444e9908a51d1cb236a27862abc769c9","deviceId":"' + device_id + '"}'
         data = {
             'data': data_val,
         }
         headers = {
-            "Host": "h5api.m.goofish.com",
-            "sec-ch-ua-platform": "\"Windows\"",
-            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
-            "accept": "application/json",
-            "sec-ch-ua": "\"Chromium\";v=\"146\", \"Not-A.Brand\";v=\"24\", \"Google Chrome\";v=\"146\"",
             "content-type": "application/x-www-form-urlencoded",
-            "sec-ch-ua-mobile": "?0",
-            "origin": "https://www.goofish.com",
-            "sec-fetch-site": "same-site",
-            "sec-fetch-mode": "cors",
-            "sec-fetch-dest": "empty",
-            "referer": "https://www.goofish.com/",
-            "accept-language": "en,zh-CN;q=0.9,zh;q=0.8,zh-TW;q=0.7,ja;q=0.6",
-            "priority": "u=1, i"
         }
         # 简单获取token，信任cookies已清理干净
         token = self.session.cookies.get('_m_h5_tk', '').split('_')[0]
@@ -192,7 +231,7 @@ class XianyuApis:
         params['sign'] = sign
         
         try:
-            response = self.session.post('https://h5api.m.goofish.com/h5/mtop.taobao.idlemessage.pc.login.token/1.0/', headers=headers, params=params, data=data)
+            response = self.session.post(self.url, headers=headers, params=params, data=data)
             res_json = response.json()
             
             if isinstance(res_json, dict):
@@ -203,37 +242,10 @@ class XianyuApis:
                     error_msg = str(ret_value)
                     if 'RGV587_ERROR' in error_msg or '被挤爆啦' in error_msg:
                         logger.error(f"❌ 触发风控: {ret_value}")
-                        logger.error("🔴 系统目前无法自动解决，请进入闲鱼网页版-点击消息-过滑块-复制最新的Cookie")
-                        
-                        # 获取用户输入的新Cookie
-                        print("\n" + "="*50)
-                        new_cookie_str = input("请输入新的Cookie字符串 (复制浏览器中的完整cookie，直接回车则退出程序): ").strip()
-                        print("="*50 + "\n")
-                        
-                        if new_cookie_str:
-                            try:
-                                # 解析cookie字符串并更新session
-                                from http.cookies import SimpleCookie
-                                cookie = SimpleCookie()
-                                cookie.load(new_cookie_str)
-                                
-                                # 清空旧cookie并设置新cookie
-                                self.session.cookies.clear()
-                                for key, morsel in cookie.items():
-                                    self.session.cookies.set(key, morsel.value, domain='.goofish.com')
-                                
-                                logger.success("✅ Cookie已更新，正在尝试重连...")
-                                # 同步更新到.env文件
-                                self.update_env_cookies()
-                                
-                                # 立即重试
-                                return self.get_token(device_id, 0)
-                            except Exception as e:
-                                logger.error(f"Cookie解析失败: {e}")
-                                sys.exit(1)
-                        else:
-                            logger.info("用户取消输入，程序退出")
-                            sys.exit(1)
+                        logger.error(
+                            "服务端要求用户校验；停止自动重试，避免短时间内重复请求加重风控"
+                        )
+                        raise RiskControlError(ret_value)
 
                     logger.warning(f"Token API调用失败，错误信息: {ret_value}")
                     # 处理响应中的Set-Cookie
@@ -249,6 +261,8 @@ class XianyuApis:
                 logger.error(f"Token API返回格式异常: {res_json}")
                 return self.get_token(device_id, retry_count + 1)
                 
+        except RiskControlError:
+            raise
         except Exception as e:
             logger.error(f"Token API请求异常: {str(e)}")
             time.sleep(0.5)
@@ -263,7 +277,7 @@ class XianyuApis:
         params = {
             'jsv': '2.7.2',
             'appKey': '34839810',
-            't': str(int(time.time()) * 1000),
+            't': str(int(time.time() * 1000)),
             'sign': '',
             'v': '1.0',
             'type': 'originaljson',

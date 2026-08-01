@@ -6,7 +6,7 @@ import os
 import websockets
 from loguru import logger
 from dotenv import load_dotenv, set_key
-from XianyuApis import XianyuApis
+from XianyuApis import RiskControlError, XianyuApis
 import sys
 import random
 
@@ -24,7 +24,14 @@ class XianyuLive:
         self.cookies = trans_cookies(cookies_str)
         self.xianyu.session.cookies.update(self.cookies)  # 直接使用 session.cookies.update
         self.myid = self.cookies['unb']
-        self.device_id = generate_device_id(self.myid)
+        self.device_id = os.getenv("DEVICE_ID", "").strip() or generate_device_id(self.myid)
+        self.risk_control_error = None
+        self.risk_control_retry_interval = max(
+            300,
+            int(os.getenv("RISK_CONTROL_RETRY_INTERVAL", "1800")),
+        )
+        self.browser_user_agent = self.xianyu.session.headers["user-agent"]
+        self.browser_accept_language = self.xianyu.session.headers["accept-language"]
         self.context_manager = ChatContextManager()
         
         # 心跳相关配置
@@ -61,6 +68,7 @@ class XianyuLive:
         """刷新token"""
         try:
             logger.info("开始刷新token...")
+            self.risk_control_error = None
             
             # 获取新token（如果Cookie失效，get_token会直接退出程序）
             token_result = self.xianyu.get_token(self.device_id)
@@ -74,6 +82,10 @@ class XianyuLive:
                 logger.error(f"Token刷新失败: {token_result}")
                 return None
                 
+        except RiskControlError as e:
+            self.risk_control_error = e
+            logger.error("Token刷新被服务端风控拦截，已停止本次请求")
+            return None
         except Exception as e:
             logger.error(f"Token刷新异常: {str(e)}")
             return None
@@ -98,8 +110,17 @@ class XianyuLive:
                             await self.ws.close()
                         break
                     else:
-                        logger.error("Token刷新失败，将在{}分钟后重试".format(self.token_retry_interval // 60))
-                        await asyncio.sleep(self.token_retry_interval)  # 使用配置的重试间隔
+                        retry_interval = (
+                            self.risk_control_retry_interval
+                            if self.risk_control_error
+                            else self.token_retry_interval
+                        )
+                        logger.error(
+                            "Token刷新失败，将在{}分钟后重试".format(
+                                retry_interval // 60
+                            )
+                        )
+                        await asyncio.sleep(retry_interval)
                         continue
                 
                 # 每分钟检查一次
@@ -162,6 +183,8 @@ class XianyuLive:
             await self.refresh_token()
         
         if not self.current_token:
+            if self.risk_control_error:
+                raise self.risk_control_error
             logger.error("无法获取有效token，初始化失败")
             raise Exception("Token获取失败")
             
@@ -171,7 +194,10 @@ class XianyuLive:
                 "cache-header": "app-key token ua wv",
                 "app-key": "444e9908a51d1cb236a27862abc769c9",
                 "token": self.current_token,
-                "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36 DingTalk(2.1.5) OS(Windows/10) Browser(Chrome/133.0.0.0) DingWeb/2.1.5 IMPaaS DingWeb/2.1.5",
+                "ua": (
+                    f"{self.browser_user_agent} DingTalk(2.1.5) OS(Windows/10) "
+                    "DingWeb/2.1.5 IMPaaS DingWeb/2.1.5"
+                ),
                 "dt": "j",
                 "wv": "im:3,au:3,sy:6",
                 "sync": "0,0;0;0;",
@@ -609,10 +635,10 @@ class XianyuLive:
                     "Connection": "Upgrade",
                     "Pragma": "no-cache",
                     "Cache-Control": "no-cache",
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+                    "User-Agent": self.browser_user_agent,
                     "Origin": "https://www.goofish.com",
                     "Accept-Encoding": "gzip, deflate, br, zstd",
-                    "Accept-Language": "zh-CN,zh;q=0.9",
+                    "Accept-Language": self.browser_accept_language,
                 }
 
                 async with websockets.connect(self.base_url, extra_headers=headers) as websocket:
@@ -668,6 +694,13 @@ class XianyuLive:
 
             except websockets.exceptions.ConnectionClosed:
                 logger.warning("WebSocket连接已关闭")
+
+            except RiskControlError:
+                logger.error(
+                    f"闲鱼要求用户校验，将暂停 {self.risk_control_retry_interval // 60} 分钟后再试；"
+                    "请先在正常浏览器中确认账号可用"
+                )
+                await asyncio.sleep(self.risk_control_retry_interval)
                 
             except Exception as e:
                 logger.error(f"连接发生错误: {e}")
